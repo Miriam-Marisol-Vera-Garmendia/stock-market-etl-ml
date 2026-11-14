@@ -116,6 +116,8 @@ def build_dataset() -> pd.DataFrame:
             subset=available + ["y", "ret_fwd"]
         ).copy()
 
+        clean = clean[np.isfinite(clean["ret_fwd"])].copy()
+
         # El target se conserva como float mientras puede contener NaN;
         # después del dropna ya es seguro convertirlo a entero.
         clean["y"] = clean["y"].astype(int)
