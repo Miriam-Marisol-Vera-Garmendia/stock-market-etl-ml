@@ -49,6 +49,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from lightgbm import LGBMClassifier, LGBMRegressor  # noqa: E402
+from sklearn.base import BaseEstimator, TransformerMixin  # noqa: E402
 from sklearn.impute import SimpleImputer  # noqa: E402
 from sklearn.linear_model import LogisticRegression, Ridge  # noqa: E402
 from sklearn.metrics import roc_auc_score  # noqa: E402
@@ -61,7 +62,9 @@ from src.data.store import get as store_get  # noqa: E402
 from src.ml.features import (  # noqa: E402
     FEATURE_COLS, add_cross_section_features, add_macro_features, compute_features,
 )
+from src.ml.dividend_features import DIVIDEND_FEATURE_COLS  # noqa: E402
 from src.ml.purged_cv import purged_walk_forward_date_splits  # noqa: E402
+from src.ml.rates_features import RATES_FEATURE_COLS  # noqa: E402
 from src.ml.shared.evaluators.cross_section import ic_by_date  # noqa: E402
 from src.ml.targets import (  # noqa: E402
     EXTRA_FEATURE_COLS, build_targets, extra_features, is_regression, label_span,
@@ -76,7 +79,10 @@ MIN_EMBARGO = 10
 
 ALL_TARGETS = ["dir_5", "rel_5", "dir_21", "rel_21", "dir_63", "rel_63",
                "log_rv_fwd_5", "log_rv_fwd_21"]
-FEATS = FEATURE_COLS + EXTRA_FEATURE_COLS
+# Tasas (snapshots desde jul-2026) y dividendos (solo algunos tickers) no cubren toda la
+# historia: igual que model_feature_cols() en backtest_topk.py, quedan fuera de los modelos.
+AUX_FEATURE_COLS = set(RATES_FEATURE_COLS) | set(DIVIDEND_FEATURE_COLS)
+FEATS = [c for c in FEATURE_COLS if c not in AUX_FEATURE_COLS] + EXTRA_FEATURE_COLS
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -133,10 +139,32 @@ def build_panel(entry: str = "close", horizon_mode: str = "rows") -> pd.DataFram
 
 # ─── Modelos ─────────────────────────────────────────────────────────────────
 
+class QuantileClipper(BaseEstimator, TransformerMixin):
+    """
+    Recorta cada columna a sus cuantiles 0.1 % y 99.9 % del TRAIN (solo modelos lineales).
+
+    Algunas features (vol_down_up, obv_slope) tienen valores hasta ~900 veces su
+    percentil 99.9. Los árboles no se ven afectados, pero un modelo lineal los
+    multiplica por su coeficiente y la predicción explota. Los NaN se conservan.
+    """
+
+    def __init__(self, q: float = 0.001):
+        self.q = q
+
+    def fit(self, X, y=None):
+        a = np.asarray(X, dtype=float)
+        self.lo_ = np.nanquantile(a, self.q, axis=0)
+        self.hi_ = np.nanquantile(a, 1 - self.q, axis=0)
+        return self
+
+    def transform(self, X):
+        return np.clip(np.asarray(X, dtype=float), self.lo_, self.hi_)
+
+
 def classifiers(n_trees: int) -> dict:
     return {
         "logreg": make_pipeline(
-            SimpleImputer(strategy="median"), StandardScaler(),
+            QuantileClipper(), SimpleImputer(strategy="median"), StandardScaler(),
             LogisticRegression(C=0.1, max_iter=1000, random_state=SEED)),
         "lightgbm": LGBMClassifier(
             n_estimators=n_trees, learning_rate=0.03, num_leaves=15,
@@ -155,7 +183,8 @@ def regressors(n_trees: int) -> dict:
     return {
         "har": HARModel(),
         "ridge": make_pipeline(
-            SimpleImputer(strategy="median"), StandardScaler(), Ridge(alpha=1.0)),
+            QuantileClipper(), SimpleImputer(strategy="median"), StandardScaler(),
+            Ridge(alpha=1.0)),
         "lightgbm": LGBMRegressor(
             n_estimators=n_trees, learning_rate=0.03, num_leaves=15,
             min_child_samples=200, subsample=0.8, subsample_freq=1,
@@ -204,7 +233,9 @@ def evaluate_target(panel: pd.DataFrame, target: str, n_splits: int,
             fold["models"]["naive"] = regression_metrics(y_te, y_naive, y_naive)
             for name, model in regressors(n_trees).items():
                 model.fit(X_tr, y_tr)
-                fold["models"][name] = regression_metrics(y_te, model.predict(X_te), y_naive)
+                # Ninguna predicción fuera del rango visto en train (evita exp() desbordado).
+                pred = np.clip(model.predict(X_te), np.nanmin(y_tr), np.nanmax(y_tr))
+                fold["models"][name] = regression_metrics(y_te, pred, y_naive)
         else:
             fold["base_rate_test"] = float(y_te.mean())
             for name, model in classifiers(n_trees).items():
