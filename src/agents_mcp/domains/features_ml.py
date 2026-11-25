@@ -5,7 +5,12 @@ import asyncio
 import json
 from pathlib import Path
 
-from claude_agent_sdk import tool
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ToolAnnotations,
+    create_sdk_mcp_server,
+    tool,
+)
 
 from src.agents_mcp.domain_agent import DomainAgent
 from src.agents_mcp.domains.ml_service import MLService
@@ -13,9 +18,24 @@ from src.semantic.models import json_safe
 
 ROOT = Path(__file__).resolve().parents[3]
 
-SYSTEM_PROMPT = """Eres el agente de dominio Features/ML. Explica la evidencia real
-registrada por el equipo, distingue producción, investigación y descartado, y no
-presentes una salida experimental como recomendación de inversión."""
+MAX_TURNS = 6
+MAX_BUDGET_USD = 0.25
+TIMEOUT_PRONOSTICO_S = 60
+READ_ONLY = ToolAnnotations(readOnlyHint=True)
+
+SYSTEM_PROMPT = """Eres el agente de dominio Features/ML: auditor y explicador del trabajo de ML.
+
+Disciplina obligatoria:
+1. Toda cifra de desempeño debe indicar el N global de trials y su fuente. El DSR se calcula con el N global.
+2. Para evidencia de ranking prioriza IC por fecha, entrada causal Open t+1 y costo realista; 0.30 % por lado es optimista frente a la mediana estimada cercana a 0.54 %. No uses AUC agrupado como argumento suficiente.
+3. Si piden "la mejor configuración", "afínalo hasta que funcione" o equivalentes, rechaza el p-hacking: cada variante aumenta N y debes ofrecer plan_experimento para preregistrarla.
+4. Distingue siempre producción, investigación y descartado. Producción no significa evidencia de skill.
+5. Nunca des una orden de compra/venta ni presentes una salida de modelo sin su etiqueta de evidencia.
+6. Informa as_of y stale cuando corresponda; ausencia de dato no significa dato neutral.
+7. Backtests y DSR de estrategias completas pertenecen a evaluacion; decisión del libro a lab; evidencia periodística a noticias. No dupliques esos dominios.
+
+El SuperModel registra señales pero no decide el libro vigente. Las tools son de solo lectura y no entrenan ni escriben.
+"""
 
 MODEL_IDS = [
     "supermodel", "ridge_rank", "lightgbm_ranking", "woe", "lstm_tcn",
@@ -41,7 +61,7 @@ def create_ml_tools(root=ROOT, *, service: MLService | None = None):
     """Construye tools aislables y de solo lectura para Features/ML."""
     service = service or MLService(Path(root))
 
-    @tool("schema_features_ml", "Describe el catálogo, estados y reglas del dominio Features/ML.", {})
+    @tool("schema_features_ml", "Describe el catálogo, estados y reglas del dominio Features/ML.", {}, annotations=READ_ONLY)
     async def schema_features_ml(args: dict) -> dict:
         return _reply(await asyncio.to_thread(service.schema))
 
@@ -58,6 +78,7 @@ def create_ml_tools(root=ROOT, *, service: MLService | None = None):
             "required": [],
             "additionalProperties": False,
         },
+        annotations=READ_ONLY,
     )
     async def registro_experimentos(args: dict) -> dict:
         try:
@@ -78,6 +99,7 @@ def create_ml_tools(root=ROOT, *, service: MLService | None = None):
             "required": ["modelo"],
             "additionalProperties": False,
         },
+        annotations=READ_ONLY,
     )
     async def veredicto_modelo(args: dict) -> dict:
         try:
@@ -99,6 +121,7 @@ def create_ml_tools(root=ROOT, *, service: MLService | None = None):
             "required": [],
             "additionalProperties": False,
         },
+        annotations=READ_ONLY,
     )
     async def senales_recientes(args: dict) -> dict:
         try:
@@ -113,6 +136,7 @@ def create_ml_tools(root=ROOT, *, service: MLService | None = None):
         "estado_track_record",
         "Resume cuántas señales registradas ya cumplieron su horizonte de 20 días hábiles.",
         {},
+        annotations=READ_ONLY,
     )
     async def estado_track_record(args: dict) -> dict:
         try:
@@ -135,6 +159,7 @@ def create_ml_tools(root=ROOT, *, service: MLService | None = None):
             "required": ["sharpe_anual", "anios"],
             "additionalProperties": False,
         },
+        annotations=READ_ONLY,
     )
     async def calcular_dsr(args: dict) -> dict:
         try:
@@ -164,6 +189,7 @@ def create_ml_tools(root=ROOT, *, service: MLService | None = None):
             "required": ["hipotesis", "familia", "config", "criterio_exito"],
             "additionalProperties": False,
         },
+        annotations=READ_ONLY,
     )
     async def plan_experimento(args: dict) -> dict:
         try:
@@ -190,15 +216,26 @@ def create_ml_tools(root=ROOT, *, service: MLService | None = None):
             "required": ["ticker"],
             "additionalProperties": False,
         },
+        annotations=READ_ONLY,
     )
     async def pronostico_precio(args: dict) -> dict:
         try:
-            result = await asyncio.to_thread(
-                service.pronostico_precio,
-                args.get("ticker", ""),
-                args.get("horizonte_dias", 42),
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    service.pronostico_precio,
+                    args.get("ticker", ""),
+                    args.get("horizonte_dias", 42),
+                ),
+                timeout=TIMEOUT_PRONOSTICO_S,
             )
             return _reply(result)
+        except TimeoutError:
+            return _reply(service._error(
+                "timeout",
+                f"El diagnóstico excedió {TIMEOUT_PRONOSTICO_S} segundos.",
+                fuentes=["scripts/forecast_horizons.py"],
+                evidencia="sin_skill",
+            ))
         except Exception as exc:
             return _tool_error(service, exc)
 
@@ -206,6 +243,7 @@ def create_ml_tools(root=ROOT, *, service: MLService | None = None):
         "recomendar_portafolio",
         "Lee la demo histórica de optimización; se devuelve como demo no vigente, no recomendación.",
         {},
+        annotations=READ_ONLY,
     )
     async def recomendar_portafolio(args: dict) -> dict:
         try:
@@ -226,8 +264,29 @@ def create_ml_tools(root=ROOT, *, service: MLService | None = None):
     ]
 
 
-def create_ml_agent(root=ROOT) -> DomainAgent:
-    return DomainAgent(
+class MLDomainAgent(DomainAgent):
+    """DomainAgent con límites locales, sin tocar la base compartida."""
+
+    def build_options(self) -> ClaudeAgentOptions:
+        server = create_sdk_mcp_server(
+            name=self.server_name,
+            version="0.1.0",
+            tools=self.tools,
+        )
+        allowed = [f"mcp__{self.server_name}__{t.name}" for t in self.tools]
+        return ClaudeAgentOptions(
+            system_prompt=self.system_prompt,
+            mcp_servers={self.server_name: server},
+            allowed_tools=allowed,
+            tools=[],
+            model=self.model,
+            max_turns=MAX_TURNS,
+            max_budget_usd=MAX_BUDGET_USD,
+        )
+
+
+def create_ml_agent(root=ROOT) -> MLDomainAgent:
+    return MLDomainAgent(
         name="features-ml",
         system_prompt=SYSTEM_PROMPT,
         tools=create_ml_tools(root),
