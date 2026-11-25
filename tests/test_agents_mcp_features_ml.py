@@ -53,7 +53,7 @@ def _write_catalog(root: Path) -> None:
 
 def _write_trials(root: Path) -> tuple[Path, dict]:
     path = root / "data" / "eval" / "trial_log.jsonl"
-    path.parent.mkdir(parents=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     cfg = {"alpha": 1, "h": 5}
     rows = [
         {
